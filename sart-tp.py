@@ -44,6 +44,7 @@ from psychopy.constants import (NOT_STARTED, STARTED, PLAYING, PAUSED,
 import numpy as np
 import pandas as pd
 
+
 # Constants
 PSYCHOPY_VERSION = '2021.2.2'
 EXP_NAME = 'SART-TP'
@@ -57,16 +58,29 @@ PROBE2_ISI = 3 # Blank screen duration following a probe 2 trial
 PROBE2_DURATION = 8 # Stimulus duration for a probe 2 trial
 PRACTICE_INSTRUCTIONS = [
     'Vítejte v úloze SART-TP.',
-    'V této úloze uvidíte čísla od 0 do 9. Vaším úkolem je stisknout <levou šipku> pokaždé, když se na obrazovce objeví jakékoli číslo KROMĚ čísla 3. Pokud se objeví číslo 3, <levou šipku> nestiskněte.',
-    'Občas se objeví otázky, zda byla vaše pozornost zaměřena na úkol. Pokud ano, stiskněte <levou šipku>. Pokud vaše pozornost nebyla zaměřena na úkol, stiskněte <pravou šipku>.',
-    'Pokud bude vaše pozornost zaměřena na úkol, budete vyzváni/y ke stisknutí buď <levé šipky>, nebo <pravé šipky>.',
-    'Pokud vaše pozornost nebyla zaměřena na úkol, budete dotázáni/y, zda byla vaše pozornost rozptýlena vnějšími podněty <levá šipka>, nebo zda jste se zasnil/a <pravá šipka>.'
+    'V této úloze uvidíte čísla od 0 do 9. Vaším úkolem je stisknout ← levou šipku pokaždé, když se na obrazovce objeví jakékoli číslo KROMĚ čísla 3.\n Pokud se objeví číslo 3, ← levou šipku nestiskněte.',
+    'Občas se může objevit otázka, zda byla vaše pozornost zaměřena na úkol. \n Pokud ano, stiskněte ← levou šipku. \n\n Pokud vaše pozornost nebyla zaměřena na úkol, stiskněte → pravou šipku.',
+    'Pokud bude vaše pozornost zaměřena na úkol, budete vyzván/a ke stisknutí buď ← levé šipky, nebo → pravé šipky.',
+    'Pokud vaše pozornost nebyla zaměřena na úkol, budete dotázán/a, zda byla vaše pozornost rozptýlena vnějšími podněty ← levá šipka, nebo zda jste se zasnil/a → pravá šipka.'
 ]
 
 INSTRUCTIONS = [
     'Vítejte v SART-TP',
     'Úloha začne za okamžik. Prosím vyčkejte.'
 ]
+
+
+# Setup monitorů
+MON_NAME = 'taVNS_lab'
+
+if MON_NAME not in monitors.getAllMonitors():
+    sys.exit(f"Monitor '{MON_NAME}' not calibrated on this machine — run setup_monitor.py first.")
+
+mon = monitors.Monitor(MON_NAME)
+if mon.getWidth() is None or mon.getDistance() is None:
+    sys.exit(f"Monitor '{MON_NAME}' is missing width or distance.")
+
+win = visual.Window(monitor=mon, units='deg', fullscr=True)
 
 # Initial Setup
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -87,7 +101,7 @@ elif exp_info['practice'] == "Yes":
 thisExp = data.ExperimentHandler(
     name=EXP_NAME, version='',
     extraInfo=exp_info, runtimeInfo=None,
-    originPath='D:\\SART\\sart-tp.py', 
+    originPath=os.path.abspath(__file__),
     savePickle=True, saveWideText=True,
     dataFileName=filename
 )
@@ -133,21 +147,23 @@ block_count = 1
 global_clock = core.Clock()
 timestamp_clock = core.Clock()
 
-def display_instructions(instructions, duration):
+def display_instructions(instructions):
     '''
-    Displays a list of instructions on the screen, each for a specified duration.
-    
+    Displays a list of instruction slides, advancing to the next slide when the
+    participant presses the <right> key. Pressing <escape> quits the task.
+
     Parameters:
     instructions (list): a list of strings, where each string is an instruction slide.
-    duration (int or float): the duration for which each instruction is displayed on the screen in seconds.
     '''
     core.wait(5) # Wait for program to be set to fullscreen before starting instructions
     for instr in instructions:
         instr_stim.setText(instr)
-        instruction_timer = core.CountdownTimer(duration)
-        while instruction_timer.getTime() > 0:
-            instr_stim.draw()
-            window.flip()
+        instr_stim.draw()
+        window.flip()
+        keys = event.waitKeys(keyList=['right', 'escape'])
+        if 'escape' in keys:
+            window.close()
+            core.quit()
 
 def display_break(start_number, block_count):
     '''
@@ -370,7 +386,26 @@ def run_probe2_trial(trial, trial_clock, previous_resp, total_probe2_frames, pro
         thisExp.addData('timestamp', timestamp)
         thisExp.addData('probe2', probe2)
         
-# Sets condition files for either practice or real experiment    
+def quit_experiment():
+    '''
+    Aborts the run immediately from anywhere, saving whatever data has been
+    collected so far. Registered as a global key handler, so it fires from
+    within window.flip() regardless of where execution currently is.
+    '''
+    try:
+        thisExp.saveAsWideText(filename + '.csv', delim='auto')
+        thisExp.saveAsPickle(filename)
+        logging.flush()
+    except Exception:
+        pass
+    thisExp.abort()
+    window.close()
+    core.quit()
+
+# Abort the run at any time with <escape>
+event.globalKeys.add(key='escape', func=quit_experiment)
+
+# Sets condition files for either practice or real experiment
 if exp_info['practice'] == 'No':
     block_files = [
     'Block1.xlsx'
@@ -381,7 +416,7 @@ else:
 # Main Experiment Loop   
 for block in block_files:
     if block_count == 1:
-        display_instructions(PRACTICE_INSTRUCTIONS, 10)
+        display_instructions(PRACTICE_INSTRUCTIONS)
     trials = initialize_trial_handler(block)
     display_break(5, block_count)
     display_blank()
