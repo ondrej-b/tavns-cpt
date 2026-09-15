@@ -35,6 +35,7 @@ and probe 2), totaling 345 trials. Targets and thought probe pairs were pseudoco
 
 import os
 import sys
+from collections import namedtuple
 from psychopy import locale_setup
 from psychopy import prefs
 from psychopy import sound, gui, visual, core, data, event, logging, clock, colors, monitors
@@ -56,6 +57,18 @@ PROBE1_ISI = 3 # Blank screen duration following a probe 1 trial
 PROBE1_DURATION = 8 # Stimulus duration for a probe 1 trial
 PROBE2_ISI = 3 # Blank screen duration following a probe 2 trial
 PROBE2_DURATION = 8 # Stimulus duration for a probe 2 trial
+
+# Cedrus RB-840 (XID mode) response pad — optional, runs alongside the keyboard.
+# Set USE_CEDRUS = False to run keyboard-only, e.g. when piloting without the pad.
+# CEDRUS_LEFT_BUTTON / CEDRUS_RIGHT_BUTTON are 0-indexed XID button numbers, not
+# physical positions — identify yours by running the printout in poll_cedrus's
+# docstring below, or Cedrus's own XID device test utility, while pressing each
+# button in turn.
+USE_CEDRUS = True
+CEDRUS_LEFT_BUTTON = 2   # XID button wired to the participant's left index finger
+CEDRUS_RIGHT_BUTTON = 5  # XID button wired to the participant's right index finger
+CEDRUS_KEY_MAP = {CEDRUS_LEFT_BUTTON: 'left', CEDRUS_RIGHT_BUTTON: 'right'}
+
 PRACTICE_INSTRUCTIONS = [
     'Vítejte v úloze SART-TP.',
     'V této úloze uvidíte čísla od 0 do 9. Vaším úkolem je stisknout ← levou šipku pokaždé, když se na obrazovce objeví jakékoli číslo KROMĚ čísla 3.\n Pokud se objeví číslo 3, ← levou šipku nestiskněte.',
@@ -79,8 +92,6 @@ if MON_NAME not in monitors.getAllMonitors():
 mon = monitors.Monitor(MON_NAME)
 if mon.getWidth() is None or mon.getDistance() is None:
     sys.exit(f"Monitor '{MON_NAME}' is missing width or distance.")
-
-win = visual.Window(monitor=mon, units='deg', fullscr=True)
 
 # Initial Setup
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -109,13 +120,66 @@ log_file = logging.LogFile(filename + '.log', level=logging.EXP)
 logging.console.setLevel(logging.WARNING)
 
 # Window Setup
-monitor = monitors.Monitor('monitor')
-window = visual.Window(size=(1920, 1080), fullscr=True)
+window = visual.Window(monitor=mon, size=(1920, 1080), fullscr=True)
 exp_info['frameRate'] = window.getActualFrameRate()
 frame_dur = 1.0 / round(exp_info['frameRate']) if exp_info['frameRate'] else REFRESH_RATE
 
 # Stimuli
 kb = keyboard.Keyboard()
+
+# Cedrus RB-840 (XID) response pad — talk to pyxid2 directly rather than via
+# psychopy.hardware.cedrus, whose wrapper API has changed across PsychoPy
+# versions (getXidDevices isn't present on every build); pyxid2 itself is the
+# stable underlying driver.
+cedrus_dev = None
+if USE_CEDRUS:
+    try:
+        import pyxid2
+        xid_devices = pyxid2.get_xid_devices()
+        if xid_devices:
+            cedrus_dev = xid_devices[0]
+            cedrus_dev.reset_timer()
+        else:
+            logging.warning('USE_CEDRUS is True but no Cedrus XID device was detected; continuing keyboard-only.')
+    except Exception as cedrus_err:
+        logging.warning(f'Cedrus XID device could not be initialized ({cedrus_err}); continuing keyboard-only.')
+
+Response = namedtuple('Response', ['name', 'rt'])
+
+def reset_response_clocks():
+    '''
+    Resets the response-timing clocks for both input devices together, so
+    Cedrus and keyboard RTs are measured from the same instant. Call this
+    everywhere kb.clock.reset() was previously called.
+    '''
+    kb.clock.reset()
+    if cedrus_dev is not None:
+        cedrus_dev.reset_timer()
+
+def poll_cedrus():
+    '''
+    Drains the Cedrus device's response queue and returns newly pressed
+    buttons as a list of Response, filtered to CEDRUS_KEY_MAP and named
+    'left'/'right' to match kb.getKeys() output. rt is in seconds, measured
+    since the last reset_response_clocks() call, so it can be used the same
+    way as a Keypress's .rt (e.g. key.rt * 1000 for ms) wherever the two are
+    merged.
+
+    To find your pad's button numbers: temporarily change the "if evt['pressed']
+    and ..." line below to "if evt['pressed']: print(evt['key'])" and press
+    each button in turn while the task is running.
+    '''
+    responses = []
+    if cedrus_dev is None:
+        return responses
+    cedrus_dev.poll_for_response()
+    while cedrus_dev.response_queue:
+        evt = cedrus_dev.get_next_response()
+        if evt['pressed'] and evt['key'] in CEDRUS_KEY_MAP:
+            responses.append(Response(name=CEDRUS_KEY_MAP[evt['key']], rt=evt['time'] / 1000.0))
+        cedrus_dev.poll_for_response()
+    return responses
+
 instr_stim = visual.TextStim(window)
 starting_stim = visual.TextStim(window, 'Začínáme za', font='Open Sans', pos=(0, .5))
 break_stim = visual.TextStim(window, 'PAUZA', font='Open Sans', pos=(0, .5))
@@ -150,20 +214,30 @@ timestamp_clock = core.Clock()
 def display_instructions(instructions):
     '''
     Displays a list of instruction slides, advancing to the next slide when the
-    participant presses the <right> key. Pressing <escape> quits the task.
+    participant presses the <right> key (keyboard or the Cedrus pad's right
+    button). Pressing <escape> quits the task.
 
     Parameters:
     instructions (list): a list of strings, where each string is an instruction slide.
     '''
-    core.wait(5) # Wait for program to be set to fullscreen before starting instructions
+    # Wait for program to be set to fullscreen before starting instructions
+    settle_timer = core.CountdownTimer(5)
+    while settle_timer.getTime() > 0:
+        window.flip()
+        abort_if_requested()
     for instr in instructions:
         instr_stim.setText(instr)
-        instr_stim.draw()
-        window.flip()
-        keys = event.waitKeys(keyList=['right', 'escape'])
-        if 'escape' in keys:
-            window.close()
-            core.quit()
+        advanced = False
+        while not advanced:
+            instr_stim.draw()
+            window.flip()
+            keys = [key.name for key in kb.getKeys(['right', 'escape'])]
+            keys += [resp.name for resp in poll_cedrus()]
+            if 'escape' in keys:
+                teardown_and_quit()
+            if 'right' in keys:
+                advanced = True
+            abort_if_requested()
 
 def display_break(start_number, block_count):
     '''
@@ -183,23 +257,26 @@ def display_break(start_number, block_count):
                 break_stim.draw()
             instr_stim.draw()
             window.flip()
-    
+            abort_if_requested()
+
 def display_blank():
     '''
     Displays a blank screen for 1 second.
-    
+
     Parameters:
     None
     '''
     blank_timer = core.CountdownTimer(5)
     while blank_timer.getTime() > 0:
         window.flip()
-        
+        abort_if_requested()
+
 def display_complete():
     complete_timer = core.CountdownTimer(10)
     while complete_timer.getTime() > 0:
         complete_stim.draw()
         window.flip()
+        abort_if_requested()
             
 def initialize_trial_handler(block):
     '''
@@ -237,7 +314,8 @@ def run_number_trial(trial, trial_clock, total_num_frames, num_frames):
     trial_clock.reset()
     correct=0
     sub_resp = None
-    kb.clock.reset()
+    reset_response_clocks()
+    cedrus_responses = []
     for frame_n in range(total_num_frames):
         if 0 <= frame_n < num_frames:
             stim.setText(trial['stimulus'])
@@ -247,7 +325,9 @@ def run_number_trial(trial, trial_clock, total_num_frames, num_frames):
                 stim_onset = global_clock.getTime() * 1000
         elif num_frames <= frame_n < total_num_frames:
             window.flip()
-    keys = kb.getKeys(['left'])
+        cedrus_responses += poll_cedrus()
+        abort_if_requested()
+    keys = sorted(kb.getKeys(['left']) + cedrus_responses, key=lambda k: k.rt)
     rt = None
     timestamp = None
     for key in keys:
@@ -257,8 +337,8 @@ def run_number_trial(trial, trial_clock, total_num_frames, num_frames):
             correct = 1 if key.name == trial['corrAns'] else 0
             timestamp = (float(rt) + float(stim_onset))
             break
-        
-    #timestamp = float(rt) + float(stim_onset)     
+
+    #timestamp = float(rt) + float(stim_onset)
     if trial['trialType'] == "Target" and not keys:
         correct = 1
     
@@ -286,7 +366,7 @@ def run_probe1_trial(trial, trial_clock, total_probe1_frames, probe1_frames):
     rt = None
     probe1 = 0
     previous_resp = 0
-    kb.clock.reset()
+    reset_response_clocks()
     timestamp = None
     for frame_n in range(total_probe1_frames):
         if 0 <= frame_n <= probe1_frames and response_captured == False:
@@ -296,7 +376,7 @@ def run_probe1_trial(trial, trial_clock, total_probe1_frames, probe1_frames):
             vertical_line.draw()
             if frame_n == 0:
                 stim_onset = global_clock.getTime() * 1000
-        keys = kb.getKeys(['left', 'right'])
+        keys = sorted(kb.getKeys(['left', 'right']) + poll_cedrus(), key=lambda k: k.rt)
         for key in keys:
             rt = key.rt*1000
             timestamp = float(rt) + float(stim_onset)
@@ -307,6 +387,7 @@ def run_probe1_trial(trial, trial_clock, total_probe1_frames, probe1_frames):
             stim_displayed = False
             response_captured = True
         window.flip()
+        abort_if_requested()
         if response_captured:
             break
     end_time = trial_clock.getTime() * 1000          
@@ -333,7 +414,7 @@ def run_probe2_trial(trial, trial_clock, previous_resp, total_probe2_frames, pro
     sub_resp = None
     probe2 = None
     rt = None
-    kb.clock.reset()
+    reset_response_clocks()
     timestamp = None
     if previous_resp == 1:
         for frame_n in range(total_probe2_frames):
@@ -343,8 +424,8 @@ def run_probe2_trial(trial, trial_clock, previous_resp, total_probe2_frames, pro
                 probe2_resp2.draw()
                 vertical_line.draw()
                 if frame_n == 0:
-                    stim_onset = global_clock.getTime() * 1000 
-            keys = kb.getKeys(['left', 'right'])
+                    stim_onset = global_clock.getTime() * 1000
+            keys = sorted(kb.getKeys(['left', 'right']) + poll_cedrus(), key=lambda k: k.rt)
             for key in keys:
                 rt = key.rt*1000
                 sub_resp = key.name
@@ -353,7 +434,8 @@ def run_probe2_trial(trial, trial_clock, previous_resp, total_probe2_frames, pro
                 if 0 <= frame_n < probe2_frames:
                     stim_displayed = False
             window.flip()
-        end_time = trial_clock.getTime() * 1000 
+            abort_if_requested()
+        end_time = trial_clock.getTime() * 1000
         add_trial_data(trial, stim_onset, end_time)
         thisExp.addData('response', sub_resp)
         thisExp.addData('rt', rt)
@@ -369,16 +451,17 @@ def run_probe2_trial(trial, trial_clock, previous_resp, total_probe2_frames, pro
                 vertical_line.draw()
                 if frame_n == 0:
                     stim_onset = global_clock.getTime() * 1000
-            keys = kb.getKeys(['left', 'right'])
+            keys = sorted(kb.getKeys(['left', 'right']) + poll_cedrus(), key=lambda k: k.rt)
             for key in keys:
                 rt = key.rt*1000
                 timestamp = float(rt) + float(stim_onset)
-                sub_resp = key.name 
+                sub_resp = key.name
                 probe2 = 2 if key.name == 'left' else 3 # 2 = external distraction, 3 = daydreaming
                 if 0 <= frame_n < probe2_frames:
                     stim_displayed = False
             window.flip()
-        end_time = trial_clock.getTime() * 1000 
+            abort_if_requested()
+        end_time = trial_clock.getTime() * 1000
         add_trial_data(trial, stim_onset, end_time)
         thisExp.addData('stimulus', "Kde se vaše mysl nacházela, když nebyla zaměřena na úkol?")
         thisExp.addData('response', sub_resp)
@@ -386,11 +469,29 @@ def run_probe2_trial(trial, trial_clock, previous_resp, total_probe2_frames, pro
         thisExp.addData('timestamp', timestamp)
         thisExp.addData('probe2', probe2)
         
-def quit_experiment():
+abort_requested = False
+
+def _request_abort():
     '''
-    Aborts the run immediately from anywhere, saving whatever data has been
-    collected so far. Registered as a global key handler, so it fires from
-    within window.flip() regardless of where execution currently is.
+    Global-key callback for <escape>. Runs inside window.flip()'s event
+    dispatch, so it must NOT touch the window or call core.quit() (that is
+    re-entrant and deadlocks). It only raises a flag; abort_if_requested()
+    does the real teardown on the main thread.
+    '''
+    global abort_requested
+    abort_requested = True
+
+def teardown_and_quit():
+    '''
+    Save whatever data exists, then end the process immediately.
+
+    Uses os._exit() rather than window.close()/core.quit(): on this setup
+    those two were leaving a frozen black (fullscreen) window behind instead
+    of actually tearing it down. os._exit() ends the process at the OS level
+    without running any further Python or pyglet/GL cleanup, so Windows
+    reclaims the window the moment the process dies — no hang, no half-closed
+    state. It skips atexit/finally blocks, which is fine here: nothing after
+    this point needs to run, and the data was already saved above.
     '''
     try:
         thisExp.saveAsWideText(filename + '.csv', delim='auto')
@@ -398,12 +499,22 @@ def quit_experiment():
         logging.flush()
     except Exception:
         pass
-    thisExp.abort()
-    window.close()
-    core.quit()
+    try:
+        thisExp.abort()
+    except Exception:
+        pass
+    os._exit(0)
+
+def abort_if_requested():
+    '''
+    Called from the main thread (right after window.flip() returns) in every
+    display/trial loop. If <escape> was pressed, tear down and quit.
+    '''
+    if abort_requested:
+        teardown_and_quit()
 
 # Abort the run at any time with <escape>
-event.globalKeys.add(key='escape', func=quit_experiment)
+event.globalKeys.add(key='escape', func=_request_abort)
 
 # Sets condition files for either practice or real experiment
 if exp_info['practice'] == 'No':
@@ -436,19 +547,11 @@ for block in block_files:
             run_probe2_trial(trial, trial_clock, previous_resp, total_probe2_frames, probe2_frames)
         trial_count+=1
         thisExp.nextEntry()
-        if 'escape' in kb.getKeys():
-            window.close()
-            core.quit()
+        abort_if_requested()
     block_count+=1
 display_complete()
 
-window.flip()        
-thisExp.saveAsWideText(filename+'.csv', delim='auto')
-thisExp.saveAsPickle(filename)
-logging.flush()
-
-thisExp.abort()
-window.close()
-core.quit()        
+window.flip()
+teardown_and_quit()
             
                 
