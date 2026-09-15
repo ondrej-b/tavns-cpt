@@ -135,12 +135,20 @@ cedrus_dev = None
 if USE_CEDRUS:
     try:
         import pyxid2
+        # get_xid_devices() only returns devices that answered the XID
+        # protocol handshake over the serial connection — a pad running in a
+        # different mode (e.g. plain keyboard emulation) simply would not be
+        # discoverable here, so anything in this list is confirmed to be in
+        # XID mode. Still filter to actual response pads, in case something
+        # else speaking XID (e.g. a StimTracker) is also connected.
         xid_devices = pyxid2.get_xid_devices()
-        if xid_devices:
-            cedrus_dev = xid_devices[0]
+        response_pads = [d for d in xid_devices if getattr(d, 'is_response_device', lambda: True)()]
+        if response_pads:
+            cedrus_dev = response_pads[0]
             cedrus_dev.reset_timer()
+            logging.info(f'Connected to Cedrus device "{getattr(cedrus_dev, "device_name", cedrus_dev)}" in XID mode.')
         else:
-            logging.warning('USE_CEDRUS is True but no Cedrus XID device was detected; continuing keyboard-only.')
+            logging.warning('USE_CEDRUS is True but no Cedrus XID response pad was detected; continuing keyboard-only.')
     except Exception as cedrus_err:
         logging.warning(f'Cedrus XID device could not be initialized ({cedrus_err}); continuing keyboard-only.')
 
